@@ -1,23 +1,31 @@
-# Vibe Pocket 0.3 — M4A + progresso + ripristino dopo crash
-Versione Android Kotlin non ufficiale di trascrizione Whisper offline.
+# Vibe Pocket 0.4 — diagnosi e ottimizzazione CPU
 
-## Novità
-- Importazione **M4A (AAC), MP3, FLAC e WAV**, usando MediaExtractor + MediaCodec per convertire localmente l'audio in WAV mono PCM16 16 kHz prima di trascriverlo.
-- **Avanzamento reale** in percentuale sulla durata audio: divisione in blocchi da 30 secondi. La percentuale cresce al termine di ogni blocco: non è una stima dei minuti residui. Il pre-processing M4A ha percentuale separata.
-- **Checkpoint atomico dopo ogni blocco** con testo e timestamp; se Android termina il processo, riaprire l'app e premere **RIPRENDI DOPO INTERRUZIONE**. Il blocco in elaborazione al momento dell'arresto verrà ricalcolato.
-- Servizio foreground con notifica per continuare anche quando la schermata viene chiusa; i limiti dei servizi foreground Android 15+ possono interrompere sessioni molto lunghe. Non garantisce sopravvivenza a "Forza arresto", riavvio dispositivo o cancellazione dati.
-- Audio importati e WAV di lavoro conservati nello spazio privato dell'app fino alla sostituzione del lavoro. Il download dei modelli Whisper è separato.
+App Android indipendente/non ufficiale che trascrive audio offline con whisper.cpp; sorgenti e workflow di compilazione GitHub Actions.
 
-## Modelli
-Tiny, Base, Small, Medium Q5/Q8/full, Large v3 Turbo Q5/Q8/full, Large v3 Q5/full, Large v2 Q5/full, Large v1 e GGML importato. Il telefono deve avere RAM sufficiente per caricare i modelli grandi.
+## Novità 0.4
+
+- **Diagnostica in tempo reale**: fase di preparazione M4A, caricamento modello, numero del blocco corrente, secondi trascorsi sul blocco, ultimo tempo misurato e tempo di caricamento del modello.
+- **Stima residua**, dopo almeno un blocco completato, calcolata dalla media effettiva; non una promessa di tempo certo.
+- **Segnale di attività del servizio** registrato ogni 10 secondi, per distinguere un processo ancora in esecuzione da una possibile interruzione. Il segnale non dimostra che il decoder Whisper stia avanzando internamente.
+- **Selettore thread**: 4, 6 o 8 thread CPU; impostazione applicata ai nuovi lavori, non cambia un job in corso o già salvato.
+- **Benchmark CPU facoltativo** su un campione di 10 secondi della trascrizione completata, confronta 4/6/8 thread con lo stesso modello. Memorizza la scelta consigliata per le trascrizioni successive, solo quando l'utente conferma.
+- Lingua predefinita per i nuovi lavori: **italiano**, selezione modificabile.
+- Rimangono M4A (AAC), WAV, MP3, FLAC, registrazione, download dei modelli Whisper Tiny/Base/Small/Medium/Large, trascrizione a segmenti da 30 secondi, salvataggio checkpoint per ripresa dopo crash, export TXT/SRT/VTT.
+
+## GPU — stato reale
+
+**La versione 0.4 continua a usare la CPU (whisper.cpp / NEON): NON utilizza la GPU**. Il motore AAR `dev.ffmpegkit-maintained:whisper-android:1.0.0` è distribuito con `GGML_NEON=ON` e senza Vulkan; non può essere accelerato con un interruttore nell'interfaccia. Per un backend Vulkan su Mali occorre compilare una libreria nativa NDK Vulkan, testarla sul modello Large-v3 Turbo Q5 e predisporre un fallback per hardware non compatibile. La diagnostica riporta i dettagli della libreria installata, senza affermare un'accelerazione non presente.
 
 ## Installazione
-Nel repository: **Actions → Compila Vibe Pocket APK → ultima build verde → Artifacts → VibePocket-Android-APK**.
-L'APK è una build debug per Android ARM64 (8.0+). GitHub Actions può usare una chiave debug diversa tra compilazioni: per aggiornare un APK esistente Android potrebbe richiedere disinstallazione, che elimina anche i modelli e le trascrizioni salvati nell'app. Fare un backup esportando il testo prima di disinstallare. Non installare la build come se fosse un'app di produzione.
+
+In **Actions → Compila Vibe Pocket APK → ultima build riuscita → Artifacts**, scaricare `VibePocket-Android-APK`, estrarre il file `app-debug.apk` e installarlo su Android ARM64 (minSdk 26). Per aggiornare un APK debug precedente potrebbero non coincidere le firme: se Android richiede la disinstallazione, esportare prima i testi. Disinstallare cancella modelli e checkpoint. Evitare di fare benchmark durante una trascrizione in corso.
+
+## Benchmark e prestazioni
+
+Nel test effettuato con il dispositivo dell'utente, 4 minuti di audio Large-v3 Turbo Q5 hanno richiesto circa 28 minuti con 4 thread CPU. Non è un dato valido per tutti i dispositivi. Dopo una trascrizione completata, premere **Benchmark 4/6/8 thread**. Il benchmark può richiedere vari minuti e usa la CPU, quindi il telefono può scaldarsi. I risultati del benchmark sono indicativi: testare con condizioni termiche simili. Se 8 thread è più lento di 4, scegliere il valore minore.
 
 ## Limiti
-- I blocchi consecutivi di 30 secondi possono spezzare parole/frasi ai confini e non garantiscono continuità perfetta. I timestamp riflettono la posizione dei blocchi.
-- Il recupero dei checkpoint richiede che il file sorgente, il modello e i dati privati dell'app siano ancora presenti.
-- Alcuni codec M4A poco comuni possono non essere supportati dal decoder Android del dispositivo.
-- Con modelli molto grandi, il sistema può uccidere il processo per memoria insufficiente anche ripetutamente.
-- Non inclusi Parakeet, Nemotron, diarizzazione o riassunto.
+
+Questa build non garantisce che i grandi modelli girino su ogni smartphone. La ripresa riparte dall'ultimo blocco completato e non dall'ultimo secondo inferito. Le parole al confine dei blocchi possono essere divise. Il benchmark è legato al ciclo di vita della schermata (non un servizio di background). Android può limitare i servizi in foreground, e la persistenza non sopravvive a disinstallazione/cancellazione dati.
+
+Il progetto non integra Parakeet, Nemotron né la diarizzazione.
