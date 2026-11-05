@@ -79,6 +79,7 @@ class MainActivity:Activity() {
   languageMenu=Spinner(this)
   languageMenu.adapter=ArrayAdapter(this,android.R.layout.simple_spinner_dropdown_item,langs)
   root.addView(languageMenu)
+  languageMenu.setSelection(getPreferences(Context.MODE_PRIVATE).getInt("language",1).coerceIn(0,codes.lastIndex))
   root.addView(text("PRESTAZIONI · THREAD CPU",14,accent))
   threadMenu=Spinner(this)
   threadMenu.adapter=ArrayAdapter(this,android.R.layout.simple_spinner_dropdown_item,listOf("4 thread (predefinito)","6 thread","8 thread"))
@@ -216,6 +217,7 @@ class MainActivity:Activity() {
     jobStore.newJob(audio, sourceName, m, codes[languageMenu.selectedItemPosition],
      listOf(4,6,8)[threadMenu.selectedItemPosition.coerceIn(0,2)])
     getPreferences(Context.MODE_PRIVATE).edit().putInt("threads",listOf(4,6,8)[threadMenu.selectedItemPosition.coerceIn(0,2)]).apply()
+    getPreferences(Context.MODE_PRIVATE).edit().putInt("language",languageMenu.selectedItemPosition).apply()
     refreshJob()
     resumeTranscription()
    }catch(e:Exception){notice(e.message?:"Impossibile creare il lavoro")}
