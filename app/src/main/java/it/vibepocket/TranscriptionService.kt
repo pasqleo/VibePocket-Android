@@ -18,6 +18,7 @@ class TranscriptionService : Service() {
     private lateinit var store: JobStore
     private lateinit var manager: NotificationManager
     private var running = false
+    private var heartbeat: Job? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -39,6 +40,18 @@ class TranscriptionService : Service() {
         if (running) return START_NOT_STICKY
         running = true
         worker.launch {
+            heartbeat = launch(Dispatchers.IO) {
+                while (isActive) {
+                    delay(10000L)
+                    try {
+                        store.modify { job ->
+                            if (job.phase in listOf("converting", "loading", "transcribing"))
+                                job.copy(lastHeartbeatAtMs = System.currentTimeMillis())
+                            else job
+                        }
+                    } catch (_: Exception) { }
+                }
+            }
             try {
                 process()
             } catch (e: CancellationException) {
@@ -50,6 +63,7 @@ class TranscriptionService : Service() {
                 }
                 updateNotification("Errore. Apri Vibe Pocket per riprendere.", current?.percent ?: 0)
             } finally {
+                heartbeat?.cancel()
                 running = false
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf(startId)
@@ -71,7 +85,9 @@ class TranscriptionService : Service() {
         }
 
         if (!AudioPreparer.canonical(normalized)) {
-            job = job.copy(phase = "converting", error = "", conversionPercent = 0)
+            val conversionStarted = System.currentTimeMillis()
+            job = job.copy(phase = "converting", error = "", conversionPercent = 0,
+                phaseStartedAtMs = conversionStarted, lastHeartbeatAtMs = conversionStarted)
             store.save(job)
             updateNotification("Preparazione M4A/audio: 0%", job.percent)
             var lastSaved = -1
@@ -79,29 +95,42 @@ class TranscriptionService : Service() {
                 if (pct >= lastSaved + 2 || pct == 100) {
                     lastSaved = pct
                     val updated = store.load() ?: job
-                    store.save(updated.copy(phase = "converting", conversionPercent = pct))
+                    store.save(updated.copy(phase = "converting", conversionPercent = pct, lastHeartbeatAtMs = System.currentTimeMillis()))
                     updateNotification("Preparazione audio: " + pct + "%", 0)
                 }
             }
+            job = (store.load() ?: job).copy(preparationMs = System.currentTimeMillis() - conversionStarted)
+            store.save(job)
         }
 
         val total = AudioPreparer.totalChunks(normalized)
-        job = (store.load() ?: job).copy(phase = "transcribing", error = "", totalChunks = total)
+        val loadingStart = System.currentTimeMillis()
+        job = (store.load() ?: job).copy(phase = "loading", error = "", totalChunks = total,
+            phaseStartedAtMs = loadingStart, modelLoadStartedAtMs = loadingStart, lastHeartbeatAtMs = loadingStart)
         require(job.completedChunks <= total) { "Checkpoint incompatibile con la registrazione" }
         store.save(job)
-        updateNotification("Trascrizione: " + job.percent + "%", job.percent)
+        updateNotification("Caricamento modello Whisper…", job.percent)
 
         val whisperModel = Whisper.loadModel(this, modelFile.absolutePath)
+        val loadedAt = System.currentTimeMillis()
+        job = (store.load() ?: job).copy(phase = "transcribing", error = "",
+            modelLoadMs = loadedAt - loadingStart, phaseStartedAtMs = loadedAt,
+            lastHeartbeatAtMs = loadedAt)
+        store.save(job)
+        updateNotification("Trascrizione: " + job.percent + "%", job.percent)
         try {
             val scratch = File(cacheDir, "whisper_chunk_" + job.id + ".wav")
             try {
                 while (job.completedChunks < total) {
                     ensureActiveWorker()
                     val index = job.completedChunks
+                    val chunkStart = System.currentTimeMillis()
+                    job = job.copy(chunkStartedAtMs = chunkStart, lastHeartbeatAtMs = chunkStart)
+                    store.save(job)
                     AudioPreparer.chunk(normalized, index, scratch)
                     val output = Whisper.transcribe(
                         whisperModel, scratch.absolutePath,
-                        WhisperConfig(language = job.language, threads = 4)
+                        WhisperConfig(language = job.language, threads = job.threads.coerceIn(1,8))
                     )
                     val shift = index.toLong() * AudioPreparer.CHUNK_SECONDS * 1000L
                     val newSegments = output.segments.map { segment ->
@@ -111,12 +140,17 @@ class TranscriptionService : Service() {
                             text = segment.text.trim()
                         )
                     }
+                    val chunkElapsed = System.currentTimeMillis() - chunkStart
                     // The text and completed-chunk index are committed together.
                     // A process kill retries only the unfinished chunk.
                     job = job.copy(
                         completedChunks = index + 1,
                         segments = job.segments + newSegments,
-                        phase = "transcribing"
+                        phase = "transcribing",
+                        chunkStartedAtMs = 0L,
+                        lastChunkMs = chunkElapsed,
+                        totalChunkMs = job.totalChunkMs + chunkElapsed,
+                        lastHeartbeatAtMs = System.currentTimeMillis()
                     )
                     store.save(job)
                     updateNotification(
@@ -130,7 +164,8 @@ class TranscriptionService : Service() {
         } finally {
             Whisper.releaseModel(whisperModel)
         }
-        store.save(job.copy(phase = "completed", completedChunks = total))
+        store.save(job.copy(phase = "completed", completedChunks = total,
+            completedAtMs = System.currentTimeMillis(), chunkStartedAtMs = 0L))
         updateNotification("Trascrizione completata: 100%", 100)
     }
 
