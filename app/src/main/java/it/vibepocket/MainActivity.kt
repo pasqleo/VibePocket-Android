@@ -28,6 +28,8 @@ class MainActivity:Activity() {
  private var lastScreenState = ""
  private lateinit var progress:ProgressBar
  private lateinit var resumeButton:Button
+ private lateinit var threadMenu:Spinner
+ private lateinit var diagnostics:TextView
  private val poll = object:Runnable { override fun run() { refreshJob(); handler.postDelayed(this,800L) } }
  private val recorder=Recorder()
  private val bg=Color.rgb(12,18,33)
@@ -77,11 +79,21 @@ class MainActivity:Activity() {
   languageMenu=Spinner(this)
   languageMenu.adapter=ArrayAdapter(this,android.R.layout.simple_spinner_dropdown_item,langs)
   root.addView(languageMenu)
+  root.addView(text("PRESTAZIONI · THREAD CPU",14,accent))
+  threadMenu=Spinner(this)
+  threadMenu.adapter=ArrayAdapter(this,android.R.layout.simple_spinner_dropdown_item,listOf("4 thread (predefinito)","6 thread","8 thread"))
+  root.addView(threadMenu)
+  val savedThreads=getPreferences(Context.MODE_PRIVATE).getInt("threads",4)
+  threadMenu.setSelection(listOf(4,6,8).indexOf(savedThreads).coerceAtLeast(0))
+  root.addView(button("Benchmark: confronta 4 / 6 / 8 thread"){runBenchmark()})
+  root.addView(button("Diagnostica motore CPU / GPU"){engineInfo()})
   root.addView(button("✦ AVVIA NUOVA TRASCRIZIONE"){transcribe()})
   resumeButton=button("↻ RIPRENDI DOPO INTERRUZIONE"){resumeTranscription()}
   root.addView(resumeButton)
   progress=ProgressBar(this,null,android.R.attr.progressBarStyleHorizontal).apply { max=100; progress=0 }
   root.addView(progress)
+  diagnostics=text("Tempo blocco e velocità: in attesa di una trascrizione",13,fg)
+  root.addView(diagnostics)
   root.addView(text("3  RISULTATO",19,accent))
   status=text("Pronto",13,fg);root.addView(status)
   result=text("Il testo comparirà qui.",16,fg);result.setTextIsSelectable(true);result.setPadding(12,12,12,12)
@@ -201,7 +213,9 @@ class MainActivity:Activity() {
   val mem=ActivityManager.MemoryInfo();am.getMemoryInfo(mem)
   val launch= {
    try {
-    jobStore.newJob(audio, sourceName, m, codes[languageMenu.selectedItemPosition])
+    jobStore.newJob(audio, sourceName, m, codes[languageMenu.selectedItemPosition],
+     listOf(4,6,8)[threadMenu.selectedItemPosition.coerceIn(0,2)])
+    getPreferences(Context.MODE_PRIVATE).edit().putInt("threads",listOf(4,6,8)[threadMenu.selectedItemPosition.coerceIn(0,2)]).apply()
     refreshJob()
     resumeTranscription()
    }catch(e:Exception){notice(e.message?:"Impossibile creare il lavoro")}
@@ -235,6 +249,35 @@ class MainActivity:Activity() {
    return
   }
   if(::progress.isInitialized)progress.progress=job.percent
+  if(::diagnostics.isInitialized) {
+   val now=System.currentTimeMillis()
+   val phaseElapsed=((now - job.phaseStartedAtMs).coerceAtLeast(0L)/1000L)
+   val chunkElapsed=if(job.chunkStartedAtMs>0) ((now-job.chunkStartedAtMs).coerceAtLeast(0L)/1000L) else 0L
+   val last=if(job.lastChunkMs>0) String.format(Locale.US,"%.1f",job.lastChunkMs/1000.0)+"s" else "non misurato"
+   val heartAge=if(job.lastHeartbeatAtMs>0L) ((now-job.lastHeartbeatAtMs).coerceAtLeast(0L)/1000L) else -1L
+   val heartbeat=when {
+    job.phase=="completed" -> "Completato"
+    heartAge<0L -> "Servizio non ancora verificato"
+    heartAge<=25 -> "Servizio attivo (segnale "+heartAge+"s fa)"
+    else -> "Nessun segnale da "+heartAge+"s; controlla la notifica"
+   }
+   val remaining=if(job.completedChunks>0 && job.totalChunks>job.completedChunks && job.totalChunkMs>0L) {
+    val avg=job.totalChunkMs/job.completedChunks
+    val minutes=(avg*(job.totalChunks-job.completedChunks))/60000L
+    " · Stima residua ~"+minutes+" min"
+   } else ""
+   val phaseText=when(job.phase) {
+    "converting" -> "Decodifica: "+job.conversionPercent+"% · "+phaseElapsed+"s"
+    "loading" -> "Caricamento modello: "+phaseElapsed+"s"
+    "transcribing" -> "Blocco "+(job.completedChunks+1)+"/"+job.totalChunks+" · "+chunkElapsed+"s in elaborazione"+remaining
+    "completed" -> "Modello caricato in "+(job.modelLoadMs/1000L)+"s · tutti i blocchi completati"
+    "failed" -> "Interrotto · "+job.error
+    else -> "Pronto"
+   }
+   diagnostics.text=phaseText+"\n"+heartbeat+" · "+job.threads+" thread CPU\n"+
+    "Ultimo blocco: "+last+" · Modello: "+(job.modelLoadMs/1000L)+"s"+
+    " · Preparazione: "+(job.preparationMs/1000L)+"s"
+  }
   if(::resumeButton.isInitialized)resumeButton.isEnabled=(job.phase!="completed")
   val label=when(job.phase){
    "ready" -> "Audio pronto per la trascrizione"
@@ -256,6 +299,43 @@ class MainActivity:Activity() {
     audioStatus.text="Lavoro salvato: "+job.originalName
    }
   }
+ }
+ private fun runBenchmark(){
+  if(busy){notice("Operazione già in corso");return}
+  val job=jobStore.load()
+  if(job==null || job.phase!="completed"){
+   notice("Completa prima una trascrizione: il benchmark usa il suo audio normalizzato");return
+  }
+  val model=ModelCatalog.all.firstOrNull{it.name==job.modelName}
+  if(model==null || !files.available(model)){notice("Modello del lavoro non disponibile");return}
+  val wav=File(job.normalized)
+  if(!AudioPreparer.canonical(wav)){notice("Audio di riferimento mancante");return}
+  work("Benchmark 4 / 6 / 8 thread in corso…"){
+   val measure=withContext(Dispatchers.Default){
+    CpuBenchmarker.run(this@MainActivity,wav,model,job.language){line ->
+     withContext(Dispatchers.Main){status.text=line}
+    }
+   }
+   val summary=measure.summary()
+   status.text="Benchmark terminato"
+   AlertDialog.Builder(this@MainActivity)
+    .setTitle("Risultati benchmark CPU")
+    .setMessage(summary)
+    .setPositiveButton("Usa "+measure.best.threads+" thread"){_,_->
+     val count=measure.best.threads
+     threadMenu.setSelection(listOf(4,6,8).indexOf(count).coerceAtLeast(0))
+     getPreferences(Context.MODE_PRIVATE).edit().putInt("threads",count).apply()
+     notice("Impostazione valida per le prossime trascrizioni")
+    }
+    .setNegativeButton("Chiudi",null).show()
+  }
+ }
+ private fun engineInfo(){
+  val info=try{dev.ffmpegkit.whisper.Whisper.getSystemInfo()}catch(e:Exception){"Diagnostica non disponibile: "+e.message}
+  AlertDialog.Builder(this).setTitle("Motore Whisper Android")
+   .setMessage("Questa versione usa la CPU ARM con NEON, senza accelerazione GPU Vulkan.\n\n"+
+    "Report della libreria:\n"+info)
+   .setPositiveButton("Chiudi",null).show()
  }
  private fun export(format:String){
   if(lastSegments.isEmpty() && result.text.toString().startsWith("Il testo")){notice("Trascrivi prima un audio");return}
