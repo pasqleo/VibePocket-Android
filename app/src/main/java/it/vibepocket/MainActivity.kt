@@ -10,12 +10,10 @@ import android.content.pm.PackageManager
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
-import android.provider.OpenableColumns
-import android.view.Gravity
+import android.os.Handler
+import android.os.Looper
 import android.view.View
 import android.widget.*
-import dev.ffmpegkit.whisper.Whisper
-import dev.ffmpegkit.whisper.WhisperConfig
 import kotlinx.coroutines.*
 import java.io.File
 import java.text.SimpleDateFormat
@@ -25,6 +23,12 @@ import java.util.Locale
 class MainActivity:Activity() {
  private val scope=CoroutineScope(SupervisorJob()+Dispatchers.Main)
  private lateinit var files:ModelFiles
+ private lateinit var jobStore:JobStore
+ private val handler = Handler(Looper.getMainLooper())
+ private var lastScreenState = ""
+ private lateinit var progress:ProgressBar
+ private lateinit var resumeButton:Button
+ private val poll = object:Runnable { override fun run() { refreshJob(); handler.postDelayed(this,800L) } }
  private val recorder=Recorder()
  private val bg=Color.rgb(12,18,33)
  private val panel=Color.rgb(28,40,62)
@@ -42,13 +46,14 @@ class MainActivity:Activity() {
  private var sourceName="registrazione"
  private var busy=false
  private var pendingExport="txt"
- private var lastSegments:List<dev.ffmpegkit.whisper.WhisperSegment> = emptyList()
+ private var lastSegments:List<SavedSegment> = emptyList()
  private val langs=listOf("Automatico","Italiano","English","Español","Français","Deutsch","Português")
  private val codes=listOf("auto","it","en","es","fr","de","pt")
  override fun onCreate(savedInstanceState:Bundle?) {
   super.onCreate(savedInstanceState)
   window.statusBarColor=bg;window.navigationBarColor=bg
   files=ModelFiles(this)
+  jobStore=JobStore(this)
   val scroll=ScrollView(this).apply{setBackgroundColor(bg)}
   val root=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL;setPadding(20,26,20,40)}
   scroll.addView(root);setContentView(scroll)
@@ -66,13 +71,17 @@ class MainActivity:Activity() {
   root.addView(text("2  REGISTRA O IMPORTA",19,accent))
   actionButton=button("● Avvia registrazione"){recordOrStop()}
   root.addView(actionButton)
-  root.addView(button("Importa audio WAV, MP3 o FLAC"){selectFile(101,"audio/*")})
+  root.addView(button("Importa M4A, WAV, MP3, FLAC e audio da video"){selectFile(101,"audio/*")})
   audioStatus=text("Nessun audio selezionato",13,fg);root.addView(audioStatus)
   root.addView(text("LINGUA",14,accent))
   languageMenu=Spinner(this)
   languageMenu.adapter=ArrayAdapter(this,android.R.layout.simple_spinner_dropdown_item,langs)
   root.addView(languageMenu)
-  root.addView(button("✦ TRASCRIVI SUL TELEFONO"){transcribe()})
+  root.addView(button("✦ AVVIA NUOVA TRASCRIZIONE"){transcribe()})
+  resumeButton=button("↻ RIPRENDI DOPO INTERRUZIONE"){resumeTranscription()}
+  root.addView(resumeButton)
+  progress=ProgressBar(this,null,android.R.attr.progressBarStyleHorizontal).apply { max=100; progress=0 }
+  root.addView(progress)
   root.addView(text("3  RISULTATO",19,accent))
   status=text("Pronto",13,fg);root.addView(status)
   result=text("Il testo comparirà qui.",16,fg);result.setTextIsSelectable(true);result.setPadding(12,12,12,12)
@@ -89,6 +98,8 @@ class MainActivity:Activity() {
   val saved=getPreferences(Context.MODE_PRIVATE).getInt("model",6).coerceIn(0,ModelCatalog.all.lastIndex)
   modelMenu.setSelection(saved)
   updateModel()
+  refreshJob()
+  handler.postDelayed(poll,800L)
  }
  private fun text(s:String,size:Int,color:Int)=TextView(this).apply{
   text=s;textSize=size.toFloat();setTextColor(color);setPadding(4,14,4,14)
@@ -143,9 +154,7 @@ class MainActivity:Activity() {
  private fun importAudio(uri:Uri){
   work("Importazione audio…"){
    val f=withContext(Dispatchers.IO){
-    val dst=File(cacheDir,"vibepocket_import_${System.currentTimeMillis()}.audio")
-    contentResolver.openInputStream(uri)!!.use{source->dst.outputStream().use{source.copyTo(it)}}
-    dst
+    contentResolver.openInputStream(uri)!!.use { jobStore.importSource(it, uri.lastPathSegment ?: "audio") }
    }
    chosenAudio=f;sourceName=uri.lastPathSegment?:"audio";audioStatus.text="File selezionato: $sourceName"
    status.text="Audio importato"
@@ -167,37 +176,85 @@ class MainActivity:Activity() {
     requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO),400);return
    }
    try{
-    val target=File(cacheDir,"vibepocket_record_${System.currentTimeMillis()}.wav")
+    val target=File(jobStore.root,"vibepocket_record_${System.currentTimeMillis()}.wav")
     recorder.start(target);actionButton.text="■ Termina registrazione"
     status.text="Registrazione in corso…"
    }catch(e:Exception){notice("Microfono: ${e.message}")}
   }
  }
  private fun transcribe(){
+  if(busy){notice("Termina prima il download o l'importazione");return}
   if(recorder.recording){notice("Termina prima la registrazione");return}
   val audio=chosenAudio
-  if(audio==null){notice("Seleziona prima una registrazione o un file");return}
+  if(audio==null || !audio.exists()){notice("Seleziona o registra un audio");return}
+  val existing=jobStore.load()
+  if(existing!=null && existing.phase in listOf("converting","transcribing")){
+   AlertDialog.Builder(this).setTitle("Trascrizione ancora in corso o interrotta")
+    .setMessage("Prima di avviare un nuovo lavoro, riprendi quello salvato. Non eliminiamo automaticamente il lavoro parziale.")
+    .setPositiveButton("Riprendi"){_,_->resumeTranscription()}
+    .setNegativeButton("Annulla",null).show()
+   return
+  }
   val m=chosen()
   if(!files.available(m)){notice("Scarica prima il modello selezionato");return}
   val am=getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
   val mem=ActivityManager.MemoryInfo();am.getMemoryInfo(mem)
-  if(mem.totalMem/1024/1024/1024 < m.ramGiB){
+  val launch= {
+   try {
+    jobStore.newJob(audio, sourceName, m, codes[languageMenu.selectedItemPosition])
+    refreshJob()
+    resumeTranscription()
+   }catch(e:Exception){notice(e.message?:"Impossibile creare il lavoro")}
+  }
+  if(mem.totalMem/1024/1024/1024 < m.ramGiB) {
    AlertDialog.Builder(this).setTitle("Modello molto pesante")
-    .setMessage("Questo modello può superare la RAM disponibile o essere molto lento. Continuare?")
-    .setPositiveButton("Prova"){_,_->runTranscription(m,audio)}
-    .setNegativeButton("Scegli altro modello",null).show()
-  }else runTranscription(m,audio)
+    .setMessage("Il modello può superare la RAM disponibile. Se il sistema chiude l'app, i blocchi già completati saranno recuperabili.")
+    .setPositiveButton("Prova"){_,_->launch()}
+    .setNegativeButton("Annulla",null).show()
+  } else launch()
  }
- private fun runTranscription(m:Model,audio:File){
-  work("Trascrizione in corso, non chiudere l'app…"){
-   val transcription=withContext(Dispatchers.Default){
-    val model=Whisper.loadModel(this@MainActivity,files.file(m).absolutePath)
-    try{Whisper.transcribe(model,audio.absolutePath,WhisperConfig(language=codes[languageMenu.selectedItemPosition],threads=4))}
-    finally{Whisper.releaseModel(model)}
+ private fun resumeTranscription(){
+  val job=jobStore.load()
+  if(job==null){notice("Non c'è una trascrizione da riprendere");return}
+  if(job.phase=="completed"){notice("Trascrizione già completata");return}
+  if(!File(job.source).exists()){notice("Audio originale mancante");return}
+  val model=ModelCatalog.all.firstOrNull{it.name==job.modelName}
+  if(model==null || !files.available(model)){
+   notice("Riscarica il modello usato per questo lavoro: "+job.modelName);return
+  }
+  try {
+   startForegroundService(Intent(this,TranscriptionService::class.java))
+   status.text="Elaborazione avviata; la percentuale si aggiorna dopo ogni blocco"
+  } catch(e:Exception){notice("Avvio servizio fallito: "+e.message)}
+ }
+ private fun refreshJob(){
+  if(!::jobStore.isInitialized || !::result.isInitialized)return
+  val job=jobStore.load()
+  if(job==null){
+   if(::resumeButton.isInitialized)resumeButton.isEnabled=false
+   return
+  }
+  if(::progress.isInitialized)progress.progress=job.percent
+  if(::resumeButton.isInitialized)resumeButton.isEnabled=(job.phase!="completed")
+  val label=when(job.phase){
+   "ready" -> "Audio pronto per la trascrizione"
+   "converting" -> "Preparazione audio M4A/altro: "+job.conversionPercent+"%"
+   "transcribing" -> "Trascrizione "+job.percent+"% • "+job.completedChunks+"/"+job.totalChunks+" blocchi"
+   "completed" -> "Completata: 100%"
+   "failed" -> "Interrotta al "+job.percent+"%: "+job.error+". Premi Riprendi."
+   else -> "Trascrizione: "+job.percent+"%"
+  }
+  val snapshot=job.id+":"+job.completedChunks+":"+job.phase+":"+job.conversionPercent+":"+job.error
+  if(snapshot!=lastScreenState){
+   lastScreenState=snapshot
+   if(!busy)status.text=label
+   if(job.segments.isNotEmpty()){
+    result.text=job.transcript
+    lastSegments=job.segments
+   }else if(job.phase!="completed" && !busy)result.text="I primi segmenti compariranno qui."
+   if(job.source == chosenAudio?.absolutePath || chosenAudio==null){
+    audioStatus.text="Lavoro salvato: "+job.originalName
    }
-   result.text=transcription.text
-   lastSegments=transcription.segments
-   status.text="Trascrizione completata • ${transcription.processingTimeMs/1000}s"
   }
  }
  private fun export(format:String){
@@ -223,5 +280,5 @@ class MainActivity:Activity() {
   try{contentResolver.openOutputStream(uri)?.use{it.write(out.toByteArray(Charsets.UTF_8))};notice("File esportato")}
   catch(e:Exception){notice("Esportazione fallita: ${e.message}")}
  }
- override fun onDestroy(){scope.cancel();if(recorder.recording)recorder.stop();super.onDestroy()}
+ override fun onDestroy(){handler.removeCallbacks(poll);scope.cancel();if(recorder.recording)recorder.stop();super.onDestroy()}
 }
