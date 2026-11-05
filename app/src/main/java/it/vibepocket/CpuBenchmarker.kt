@@ -37,20 +37,21 @@ object CpuBenchmarker {
         try {
             callback("Benchmark: caricamento modello")
             val start = System.nanoTime()
-            handle = Whisper.loadModel(context, modelFile.absolutePath)
+            val loaded = Whisper.loadModel(context, modelFile.absolutePath)
+            handle = loaded
             val loadMs = (System.nanoTime() - start) / 1_000_000L
             val trials = mutableListOf<CpuTrial>()
             for (threads in listOf(4, 6, 8)) {
                 callback("Benchmark: test " + threads + " thread (" + (trials.size + 1) + "/3)")
                 val started = System.nanoTime()
-                Whisper.transcribe(handle, sample.absolutePath, WhisperConfig(language=language, threads=threads))
+                Whisper.transcribe(loaded, sample.absolutePath, WhisperConfig(language=language, threads=threads))
                 val elapsed = (System.nanoTime() - started) / 1_000_000L
                 trials.add(CpuTrial(threads, elapsed))
             }
             callback("Benchmark completato")
             return CpuBenchmark(loadMs, trials)
         } finally {
-            if (handle != null) Whisper.releaseModel(handle)
+            handle?.let { Whisper.releaseModel(it) }
             sample.delete()
         }
     }
