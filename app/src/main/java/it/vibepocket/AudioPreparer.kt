@@ -77,10 +77,11 @@ object AudioPreparer {
         return ((size + CHUNK_BYTES - 1L) / CHUNK_BYTES).toInt().coerceAtLeast(1)
     }
 
-    fun chunk(wav: File, index: Int, destination: File) {
+    fun chunk(wav: File, index: Int, destination: File, seconds: Int = CHUNK_SECONDS) {
+        require(seconds in 1..CHUNK_SECONDS) { "Durata segmento non valida" }
         require(canonical(wav)) { "Audio normalizzato mancante" }
         val offset = index.toLong() * CHUNK_BYTES
-        val length = min(CHUNK_BYTES.toLong(), (wav.length() - 44L - offset).coerceAtLeast(0L))
+        val length = min((seconds.toLong() * BYTES_PER_SEC), (wav.length() - 44L - offset).coerceAtLeast(0L))
         require(length > 0) { "Indice segmento non valido" }
         RandomAccessFile(wav, "r").use { input ->
             RandomAccessFile(destination, "rw").use { out ->
