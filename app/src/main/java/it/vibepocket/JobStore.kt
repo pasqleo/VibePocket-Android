@@ -21,7 +21,18 @@ data class TranscriptionJob(
     val phase: String = "ready",
     val error: String = "",
     val segments: List<SavedSegment> = emptyList(),
-    val conversionPercent: Int = 0
+    val conversionPercent: Int = 0,
+    val threads: Int = 4,
+    val startedAtMs: Long = 0L,
+    val phaseStartedAtMs: Long = 0L,
+    val modelLoadMs: Long = 0L,
+    val modelLoadStartedAtMs: Long = 0L,
+    val chunkStartedAtMs: Long = 0L,
+    val lastChunkMs: Long = 0L,
+    val totalChunkMs: Long = 0L,
+    val preparationMs: Long = 0L,
+    val completedAtMs: Long = 0L,
+    val lastHeartbeatAtMs: Long = 0L
 ) {
     val percent: Int get() = when {
         phase == "completed" -> 100
@@ -57,7 +68,18 @@ class JobStore(context: Context) {
                 phase = obj.optString("phase", "ready"),
                 error = obj.optString("error", ""),
                 segments = segments,
-                conversionPercent = obj.optInt("conversionPercent", 0)
+                conversionPercent = obj.optInt("conversionPercent", 0),
+                threads = obj.optInt("threads", 4),
+                startedAtMs = obj.optLong("startedAtMs", 0L),
+                phaseStartedAtMs = obj.optLong("phaseStartedAtMs", 0L),
+                modelLoadMs = obj.optLong("modelLoadMs", 0L),
+                modelLoadStartedAtMs = obj.optLong("modelLoadStartedAtMs", 0L),
+                chunkStartedAtMs = obj.optLong("chunkStartedAtMs", 0L),
+                lastChunkMs = obj.optLong("lastChunkMs", 0L),
+                totalChunkMs = obj.optLong("totalChunkMs", 0L),
+                preparationMs = obj.optLong("preparationMs", 0L),
+                completedAtMs = obj.optLong("completedAtMs", 0L),
+                lastHeartbeatAtMs = obj.optLong("lastHeartbeatAtMs", 0L)
             )
         } catch (_: Exception) {
             null
@@ -77,6 +99,17 @@ class JobStore(context: Context) {
             put("phase", job.phase)
             put("error", job.error)
             put("conversionPercent", job.conversionPercent)
+            put("threads", job.threads)
+            put("startedAtMs", job.startedAtMs)
+            put("phaseStartedAtMs", job.phaseStartedAtMs)
+            put("modelLoadMs", job.modelLoadMs)
+            put("modelLoadStartedAtMs", job.modelLoadStartedAtMs)
+            put("chunkStartedAtMs", job.chunkStartedAtMs)
+            put("lastChunkMs", job.lastChunkMs)
+            put("totalChunkMs", job.totalChunkMs)
+            put("preparationMs", job.preparationMs)
+            put("completedAtMs", job.completedAtMs)
+            put("lastHeartbeatAtMs", job.lastHeartbeatAtMs)
             put("segments", JSONArray().apply {
                 job.segments.forEach { s ->
                     put(JSONObject().apply {
@@ -98,6 +131,13 @@ class JobStore(context: Context) {
         }
     }
 
+    @Synchronized fun modify(transform: (TranscriptionJob) -> TranscriptionJob): TranscriptionJob? {
+        val old = load() ?: return null
+        val updated = transform(old)
+        save(updated)
+        return updated
+    }
+
     fun importSource(from: java.io.InputStream, name: String): File {
         val dst = File(root, "audio_" + UUID.randomUUID().toString() + ".source")
         try {
@@ -110,7 +150,7 @@ class JobStore(context: Context) {
         }
     }
 
-    fun newJob(audio: File, displayName: String, model: Model, language: String): TranscriptionJob {
+    fun newJob(audio: File, displayName: String, model: Model, language: String, threads: Int): TranscriptionJob {
         require(audio.exists() && audio.length() > 0L) { "Audio non disponibile" }
         val previous = load()
         val normalized = File(root, "normalized_" + UUID.randomUUID().toString() + ".wav")
@@ -120,7 +160,10 @@ class JobStore(context: Context) {
             originalName = displayName,
             normalized = normalized.absolutePath,
             modelName = model.name,
-            language = language
+            language = language,
+            threads = threads.coerceIn(1, 8),
+            startedAtMs = System.currentTimeMillis(),
+            phaseStartedAtMs = System.currentTimeMillis()
         )
         save(job)
         if (previous != null) {
